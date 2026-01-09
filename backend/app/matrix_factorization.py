@@ -1,21 +1,17 @@
 import numpy as np
 import scipy.sparse as sp
 from typing import Dict, List, Tuple
-from app.database import supabase
-
+from sqlalchemy.orm import Session
+from .database import SessionLocal
+from .models import Feedback, Recommendation
 
 class ALSMatrixFactorization:
     """
     Alternating Least Squares (ALS) matrix factorization for collaborative filtering.
-
-    This is more sophisticated than basic SVD as it:
-    - Handles implicit feedback better
-    - Allows for regularization to prevent overfitting
-    - Can incorporate confidence weights
-    - Iteratively optimizes user and item factors
+    Adapted for Local SQLite Database.
     """
 
-    def __init__(self, n_factors: int = 50, n_iterations: int = 15, reg_lambda: float = 0.1):
+    def __init__(self, n_factors: int = 20, n_iterations: int = 10, reg_lambda: float = 0.1):
         self.n_factors = n_factors
         self.n_iterations = n_iterations
         self.reg_lambda = reg_lambda
@@ -31,61 +27,40 @@ class ALSMatrixFactorization:
 
     def _gather_interactions(self) -> Dict[Tuple[str, str], float]:
         """
-        Gather user-item interactions from feedback and recommendations tables.
-
-        Weight scheme:
-        - Clicked: +1.0
-        - Accepted: +3.0
-        - Rating: +(rating/5.0) * 2.0
-        - Just recommended: +0.1
+        Gather user-item interactions from SQLite.
         """
         interactions = {}
-
+        db: Session = SessionLocal()
+        
         try:
-            feedback_res = supabase.table("feedback").select("*").execute()
-            feedback = feedback_res.data or []
-        except Exception:
-            feedback = []
+            # 1. Get explicit feedback (clicks/ratings)
+            feedbacks = db.query(Feedback).all()
+            for f in feedbacks:
+                weight = 0.0
+                if f.clicked: weight += 1.0
+                if f.accepted: weight += 3.0
+                if f.rating: weight += (f.rating / 5.0) * 2.0
+                
+                if weight > 0:
+                    interactions[(f.student_id, f.program_id)] = interactions.get((f.student_id, f.program_id), 0.0) + weight
 
-        try:
-            recs_res = supabase.table("recommendations").select("*").execute()
-            recs = recs_res.data or []
-        except Exception:
-            recs = []
+            # 2. Get implicit feedback (previous recommendations shown)
+            # giving a small weight just for being shown allows discovery
+            recs = db.query(Recommendation).all()
+            for r in recs:
+                if r.program_id:
+                    current = interactions.get((r.student_id, r.program_id), 0.0)
+                    if current == 0:
+                        interactions[(r.student_id, r.program_id)] = 0.1
 
-        def add_action(record):
-            sid = record.get("student_id")
-            pid = record.get("program_id")
-            if not sid or not pid:
-                return
-
-            weight = 0.0
-            if record.get("clicked"):
-                weight += 1.0
-            if record.get("accepted"):
-                weight += 3.0
-            if record.get("rating") is not None:
-                try:
-                    rating = float(record.get("rating"))
-                    weight += (rating / 5.0) * 2.0
-                except Exception:
-                    pass
-
-            if weight <= 0:
-                weight = 0.1
-
-            interactions[(sid, pid)] = interactions.get((sid, pid), 0.0) + weight
-
-        for f in feedback:
-            add_action(f)
-
-        for r in recs:
-            add_action(r)
+        except Exception as e:
+            print(f"Error gathering interactions: {e}")
+        finally:
+            db.close()
 
         return interactions
 
     def _build_interaction_matrix(self, interactions: Dict[Tuple[str, str], float]) -> sp.csr_matrix:
-        """Build sparse interaction matrix from interactions dictionary."""
         users = sorted({u for (u, _) in interactions.keys()})
         items = sorted({i for (_, i) in interactions.keys()})
 
@@ -107,152 +82,57 @@ class ALSMatrixFactorization:
         return sp.csr_matrix((data, (rows, cols)), shape=(self.n_users, self.n_items))
 
     def _als_step(self, ratings: sp.csr_matrix, solve_vecs: np.ndarray, fixed_vecs: np.ndarray) -> np.ndarray:
-        """
-        Single ALS optimization step.
-
-        For each user/item, solve:
-        x_u = (Y^T C^u Y + lambda * I)^-1 Y^T C^u p(u)
-
-        where:
-        - Y is the fixed factors (item or user)
-        - C^u is the confidence matrix for user u
-        - p(u) is the preference vector
-        """
-        A = fixed_vecs.T.dot(fixed_vecs) + self.reg_lambda * np.eye(self.n_factors)
-        b = fixed_vecs.T
-
+        # Standard ALS implementation
         new_vecs = np.zeros_like(solve_vecs)
-
         for i in range(solve_vecs.shape[0]):
             if ratings.indptr[i] != ratings.indptr[i + 1]:
                 row_data = ratings.data[ratings.indptr[i]:ratings.indptr[i + 1]]
                 row_indices = ratings.indices[ratings.indptr[i]:ratings.indptr[i + 1]]
-
-                Cu = np.diag(row_data)
-                p = (row_data > 0).astype(float)
-
+                
+                # Simple implementation without confidence matrix for stability in small data
                 Y_u = fixed_vecs[row_indices]
-
-                A_u = Y_u.T.dot(Cu).dot(Y_u) + self.reg_lambda * np.eye(self.n_factors)
-                b_u = Y_u.T.dot(Cu).dot(p)
-
-                new_vecs[i] = np.linalg.solve(A_u, b_u)
+                A_u = Y_u.T.dot(np.diag(row_data)).dot(Y_u) + self.reg_lambda * np.eye(self.n_factors)
+                b_u = Y_u.T.dot(np.diag(row_data)).dot(np.ones(len(row_data))) # Target is 1 for interaction
+                
+                try:
+                    new_vecs[i] = np.linalg.solve(A_u, b_u)
+                except np.linalg.LinAlgError:
+                    new_vecs[i] = solve_vecs[i] # Fallback
             else:
                 new_vecs[i] = solve_vecs[i]
-
         return new_vecs
 
     def fit(self) -> bool:
-        """
-        Fit the ALS model on interaction data.
-
-        Returns:
-            True if fitting succeeded, False otherwise
-        """
         interactions = self._gather_interactions()
-
-        if not interactions or len(interactions) < 2:
+        if len(interactions) < 2:
+            print("⚠️ Not enough data to train Matrix Factorization.")
             self.fitted = False
             return False
 
         ratings = self._build_interaction_matrix(interactions)
+        
+        # Initialize factors
+        self.user_factors = np.random.normal(0, 0.1, (self.n_users, self.n_factors))
+        self.item_factors = np.random.normal(0, 0.1, (self.n_items, self.n_factors))
 
-        if self.n_users < 2 or self.n_items < 2:
-            self.fitted = False
-            return False
-
-        n_factors = min(self.n_factors, min(self.n_users, self.n_items) - 1)
-        if n_factors <= 0:
-            self.fitted = False
-            return False
-
-        self.user_factors = np.random.normal(0, 0.01, (self.n_users, n_factors))
-        self.item_factors = np.random.normal(0, 0.01, (self.n_items, n_factors))
-
-        for iteration in range(self.n_iterations):
+        # Optimization loop
+        for _ in range(self.n_iterations):
             self.user_factors = self._als_step(ratings, self.user_factors, self.item_factors)
             self.item_factors = self._als_step(ratings.T.tocsr(), self.item_factors, self.user_factors)
 
         self.fitted = True
+        print(f"✅ ALS Model trained on {len(interactions)} interactions.")
         return True
 
     def predict(self, user_id: str, item_id: str) -> float:
-        """
-        Predict score for a user-item pair.
-
-        Returns:
-            Predicted score (0-1 range after normalization)
-        """
-        if not self.fitted:
+        if not self.fitted: return 0.0
+        u_idx = self.user_index.get(user_id)
+        i_idx = self.item_index.get(item_id)
+        
+        if u_idx is None or i_idx is None:
             return 0.0
+            
+        return float(np.dot(self.user_factors[u_idx], self.item_factors[i_idx]))
 
-        if user_id not in self.user_index or item_id not in self.item_index:
-            return 0.0
-
-        user_idx = self.user_index[user_id]
-        item_idx = self.item_index[item_id]
-
-        score = np.dot(self.user_factors[user_idx], self.item_factors[item_idx])
-        return float(score)
-
-    def recommend_for_user(self, user_id: str, programs: List[Dict], top_k: int = 10) -> Dict[str, float]:
-        """
-        Generate recommendations for a user.
-
-        Returns:
-            Dictionary mapping program_id to normalized score (0-1)
-        """
-        if not self.fitted or user_id not in self.user_index:
-            return {}
-
-        user_idx = self.user_index[user_id]
-        user_vec = self.user_factors[user_idx]
-
-        scores = {}
-        for prog in programs:
-            pid = prog.get("id")
-            if pid in self.item_index:
-                item_idx = self.item_index[pid]
-                score = np.dot(user_vec, self.item_factors[item_idx])
-                scores[pid] = float(score)
-
-        if not scores:
-            return {}
-
-        score_values = np.array(list(scores.values()))
-        min_score = score_values.min()
-        max_score = score_values.max()
-
-        if max_score > min_score:
-            normalized_scores = {
-                pid: (score - min_score) / (max_score - min_score)
-                for pid, score in scores.items()
-            }
-        else:
-            normalized_scores = {pid: 0.5 for pid in scores.keys()}
-
-        return normalized_scores
-
-    def get_similar_items(self, item_id: str, top_k: int = 5) -> List[Tuple[str, float]]:
-        """
-        Find items similar to a given item based on factor vectors.
-
-        Returns:
-            List of (item_id, similarity_score) tuples
-        """
-        if not self.fitted or item_id not in self.item_index:
-            return []
-
-        item_idx = self.item_index[item_id]
-        item_vec = self.item_factors[item_idx]
-
-        similarities = self.item_factors.dot(item_vec)
-
-        top_indices = np.argsort(similarities)[::-1][1:top_k+1]
-
-        reverse_index = {idx: item_id for item_id, idx in self.item_index.items()}
-
-        return [(reverse_index[idx], float(similarities[idx])) for idx in top_indices]
-
-
+# Global Instance
 als_recommender = ALSMatrixFactorization()

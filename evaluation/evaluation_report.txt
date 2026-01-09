@@ -1,0 +1,18 @@
+============================================================
+STUDY PROGRAM RECOMMENDER - EVALUATION REPORT
+============================================================
+
+USER ENGAGEMENT METRICS
+------------------------------------------------------------
+Total Recommendations: 25
+Click-Through Rate:    4.00%
+Acceptance Rate:       20.00%
+
+RECOMMENDATION QUALITY METRICS
+------------------------------------------------------------
+k=1 : NDCG=0.4000, Precision=0.4000
+k=3 : NDCG=0.5262, Precision=0.2667
+k=5 : NDCG=0.5262, Precision=0.1600
+k=10: NDCG=0.5262, Precision=0.0800
+
+============================================================

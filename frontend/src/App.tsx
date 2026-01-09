@@ -1,11 +1,15 @@
 import { useState } from 'react'
+import { Routes, Route, useNavigate } from 'react-router-dom'
 import StudentForm from './components/StudentForm'
 import RecommendationsList from './components/RecommendationsList'
+import './index.css'
 
+// Interfaces
 interface Student {
-  id: string
   name: string
   email: string
+  field: string
+  gpa: number
   interests: string[]
   grades: Record<string, number>
 }
@@ -16,132 +20,114 @@ interface Recommendation {
   program_description: string
   score: number
   explanation: string
-  tags: string[]
-  skills: string[]
+  tags: string[] | string
+  skills: string[] | string
 }
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000'
+const API_BASE = 'http://localhost:8000'
 
 function App() {
-  const [student, setStudent] = useState<Student | null>(null)
   const [recommendations, setRecommendations] = useState<Recommendation[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  
+  const navigate = useNavigate()
 
-  const handleStudentSubmit = async (studentData: Omit<Student, 'id'>) => {
+  // --- THE FIXED FUNCTION ---
+  const handleStudentSubmit = async (studentData: Student) => {
     setLoading(true)
     setError(null)
+    setRecommendations([]) // Clear old results
 
     try {
-      const createResponse = await fetch(`${API_BASE}/students`, {
+      console.log("Sending data:", studentData);
+
+      // 1. ONE STEP ONLY: Send data -> Get Recommendations
+      const response = await fetch(`${API_BASE}/recommend`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(studentData),
       })
 
-      if (!createResponse.ok) {
-        throw new Error('Failed to create student profile')
+      if (!response.ok) {
+        throw new Error(`Server Error: ${response.statusText}`)
       }
 
-      const { student: createdStudent } = await createResponse.json()
-      setStudent(createdStudent)
+      const data = await response.json()
+      console.log("Received data:", data);
 
-      const recResponse = await fetch(`${API_BASE}/recommendations`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          student_id: createdStudent.id,
-          top_k: 5,
-        }),
-      })
+      // 2. Map Backend Data to Frontend Format
+      // The backend returns raw CSV fields + 'final_score'
+      // We convert them to what RecommendationsList expects
+      const formattedRecs = data.map((item: any) => ({
+        program_id: item.id || item.Course_Name, // Fallback if ID is missing
+        program_name: item.Course_Name || item.name,
+        program_description: item.Description || item.description,
+        score: item.final_score || 0,
+        explanation: item.explanation || "Matches your profile",
+        tags: item.Tags || [],
+        skills: item.Skills || []
+      }))
 
-      if (!recResponse.ok) {
-        throw new Error('Failed to get recommendations')
-      }
+      setRecommendations(formattedRecs)
 
-      const recs = await recResponse.json()
-      setRecommendations(recs)
+      // 3. Navigate to results
+      navigate('/recommendations')
+
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred')
+      console.error(err)
+      setError('Failed to get recommendations. Ensure Backend is running.')
     } finally {
       setLoading(false)
     }
   }
 
-  const handleFeedback = async (programId: string, feedbackType: 'clicked' | 'accepted') => {
-    if (!student) return
-
-    try {
-      const feedbackData = {
-        program_id: programId,
-        clicked: feedbackType === 'clicked',
-        accepted: feedbackType === 'accepted',
-      }
-
-      await fetch(`${API_BASE}/feedback?student_id=${student.id}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(feedbackData),
-      })
-    } catch (err) {
-      console.error('Failed to submit feedback:', err)
-    }
-  }
-
-  const handleReset = () => {
-    setStudent(null)
-    setRecommendations([])
-    setError(null)
+  // (Optional) Feedback Placeholder - You can enable this later if you add the DB back
+  const handleFeedback = (programId: string, type: string) => {
+    console.log(`User ${type} on program ${programId}`);
+    alert("Feedback noted! (This feature is simplified for now)");
   }
 
   return (
     <div className="container">
       <div className="header">
-        <h1>Study Program Recommender</h1>
-        <p>
-          Discover study programs that match your interests and strengths.
-          Answer a few questions and get personalized recommendations.
-        </p>
+        <h1>🎓 Study Program Recommender</h1>
+        <p>Discover programs that match your <strong>Field</strong>, <strong>GPA</strong>, and <strong>Interests</strong>.</p>
       </div>
 
-      {error && <div className="error">{error}</div>}
-
-      {!student ? (
-        <StudentForm onSubmit={handleStudentSubmit} loading={loading} />
-      ) : (
-        <>
-          <div className="card">
-            <h2>Welcome, {student.name}!</h2>
-            <p style={{ marginTop: '0.5rem', color: '#666' }}>
-              Based on your profile, here are our top recommendations:
-            </p>
-            <button
-              onClick={handleReset}
-              style={{
-                marginTop: '1rem',
-                padding: '0.5rem 1rem',
-                background: 'transparent',
-                border: '2px solid #667eea',
-                borderRadius: '8px',
-                color: '#667eea',
-                cursor: 'pointer',
-                fontWeight: 600,
-              }}
-            >
-              Start Over
-            </button>
-          </div>
-
-          {loading ? (
-            <div className="loading">Loading recommendations...</div>
-          ) : (
-            <RecommendationsList
-              recommendations={recommendations}
-              onFeedback={handleFeedback}
-            />
-          )}
-        </>
+      {error && (
+        <div className="error">{error}</div>
       )}
+
+      <Routes>
+        {/* Page 1: Input Form */}
+        <Route 
+          path="/" 
+          element={
+            <StudentForm onSubmit={handleStudentSubmit} loading={loading} />
+          } 
+        />
+
+        {/* Page 2: Recommendations List */}
+        <Route 
+          path="/recommendations" 
+          element={
+            <>
+              <button 
+                onClick={() => navigate('/')}
+                style={{ marginBottom: '1rem', cursor: 'pointer', background: 'none', border: 'none', color: '#667eea', fontWeight: 'bold' }}
+              >
+                ← Start Over
+              </button>
+              
+              <RecommendationsList
+                recommendations={recommendations}
+                onFeedback={handleFeedback}
+              />
+            </>
+          } 
+        />
+      </Routes>
     </div>
   )
 }

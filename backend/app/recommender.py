@@ -1,142 +1,103 @@
-import numpy as np
+from typing import List, Dict, Any
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from typing import List, Dict, Tuple
-import json
+import pandas as pd
+import numpy as np
 
-class ContentBasedRecommender:
+class ContentRecommender:
+    """
+    Content-Based Filtering with HARD FILTERS (Field, GPA, Tuition).
+    """
     def __init__(self):
-        self.vectorizer = TfidfVectorizer(
-            max_features=500,
-            stop_words='english',
-            ngram_range=(1, 2)
-        )
-        self.program_vectors = None
-        self.programs = []
+        self.vectorizer = TfidfVectorizer(stop_words='english')
+        self.program_matrix = None
+        self.programs_df = None
 
     def fit(self, programs: List[Dict]):
-        self.programs = programs
+        """
+        Trains the vectorizer on program tags and descriptions.
+        """
+        if not programs:
+            return
 
-        program_texts = []
-        for prog in programs:
-            text_parts = [
-                prog['name'],
-                prog['description'],
-                ' '.join(prog.get('tags', [])),
-                ' '.join(prog.get('skills', []))
-            ]
-            program_texts.append(' '.join(text_parts))
+        self.programs_df = pd.DataFrame(programs)
+        
+        # SAFETY: Ensure numeric columns exist (fill with defaults if missing)
+        # We check both direct columns and JSON fields if necessary
+        if 'min_gpa' not in self.programs_df.columns:
+            self.programs_df['min_gpa'] = 0.0
+        if 'tuition_fees' not in self.programs_df.columns:
+            self.programs_df['tuition_fees'] = 999999.0
 
-        self.program_vectors = self.vectorizer.fit_transform(program_texts)
+        # Create text soup for AI matching
+        self.programs_df['content'] = self.programs_df.apply(
+            lambda x: f"{' '.join(x['tags']) if isinstance(x['tags'], list) else str(x['tags'])} {x['description']}", 
+            axis=1
+        )
+        
+        self.program_matrix = self.vectorizer.fit_transform(self.programs_df['content'])
+        print(f"✅ Content Recommender trained on {len(programs)} programs.")
 
-    def _build_student_profile_text(self, student_data: Dict) -> str:
-        interests = student_data.get('interests', [])
-        grades = student_data.get('grades', {})
-
-        profile_parts = []
-
-        profile_parts.extend(interests * 3)
-
-        if isinstance(grades, str):
-            try:
-                grades = json.loads(grades)
-            except:
-                grades = {}
-
-        high_grade_subjects = [
-            subject for subject, grade in grades.items()
-            if grade >= 80
-        ]
-        profile_parts.extend(high_grade_subjects * 2)
-
-        return ' '.join(profile_parts)
-
-    def recommend(
-        self,
-        student_data: Dict,
-        top_k: int = 5
-    ) -> List[Tuple[Dict, float, str]]:
-        student_text = self._build_student_profile_text(student_data)
-
-        if not student_text.strip():
+    def recommend(self, student_profile: Dict[str, Any], top_k: int = 5) -> List[Dict]:
+        """
+        Returns top_k programs matching the student's profile.
+        """
+        if self.program_matrix is None or not student_profile:
             return []
 
-        student_vector = self.vectorizer.transform([student_text])
+        # --- 1. HARD FILTERS (The Precision Logic) ---
+        # Start with all programs as "True" (Keep)
+        mask = pd.Series([True] * len(self.programs_df))
 
-        similarities = cosine_similarity(student_vector, self.program_vectors)[0]
+        # A. Filter by FIELD (If user selected one)
+        student_field = str(student_profile.get('field', '')).lower().strip()
+        if student_field and student_field != 'unknown':
+            # Check if program 'field' contains the student's interest
+            field_match = self.programs_df['field'].astype(str).str.lower().str.contains(student_field, regex=False)
+            mask = mask & field_match
 
-        top_indices = np.argsort(similarities)[::-1][:top_k]
+        # B. Filter by GPA (If user has a GPA)
+        student_gpa = float(student_profile.get('gpa', 0.0))
+        if student_gpa > 0:
+            # Only keep programs where min_gpa <= student_gpa
+            gpa_match = self.programs_df['min_gpa'] <= student_gpa
+            mask = mask & gpa_match
 
-        recommendations = []
-        for idx in top_indices:
-            if similarities[idx] > 0:
-                program = self.programs[idx]
-                score = float(similarities[idx])
-                explanation = self._generate_explanation(
-                    student_data,
-                    program,
-                    score
-                )
-                recommendations.append((program, score, explanation))
+        # Get indices of programs that survived the filters
+        valid_indices = self.programs_df.index[mask].tolist()
 
-        return recommendations
+        # Fallback: If filters removed everything, show all (better than empty screen)
+        if not valid_indices:
+            print("⚠️ Filters too strict. Showing all courses.")
+            valid_indices = self.programs_df.index.tolist()
 
-    def _generate_explanation(
-        self,
-        student_data: Dict,
-        program: Dict,
-        score: float
-    ) -> str:
-        interests = student_data.get('interests', [])
-        grades = student_data.get('grades', {})
+        # --- 2. TEXT MATCHING (The AI Logic) ---
+        # Build query string from interests + field
+        interests = student_profile.get('interests', [])
+        query_text = " ".join(interests) if isinstance(interests, list) else str(interests)
+        query_text += f" {student_field}"
 
-        if isinstance(grades, str):
-            try:
-                grades = json.loads(grades)
-            except:
-                grades = {}
+        user_vector = self.vectorizer.transform([query_text])
+        
+        # Calculate scores only for valid programs
+        filtered_matrix = self.program_matrix[valid_indices]
+        scores = cosine_similarity(user_vector, filtered_matrix).flatten()
 
-        program_tags = set(program.get('tags', []))
-        program_skills = set(program.get('skills', []))
+        # --- 3. BUILD RESULT LIST ---
+        results = []
+        # Get top indices relative to our filtered list
+        top_local_indices = scores.argsort()[::-1][:top_k]
 
-        matching_interests = [
-            interest for interest in interests
-            if any(interest.lower() in tag.lower() or tag.lower() in interest.lower()
-                   for tag in program_tags.union(program_skills))
-        ]
+        for local_idx in top_local_indices:
+            score = scores[local_idx]
+            if score > 0.0:
+                # Map back to original dataframe index
+                original_idx = valid_indices[local_idx]
+                program = self.programs_df.iloc[original_idx].to_dict()
+                program['match_score'] = float(score)
+                results.append(program)
+        
+        return results
 
-        high_grade_subjects = [
-            subject for subject, grade in grades.items()
-            if grade >= 80
-        ]
-
-        relevant_subjects = [
-            subject for subject in high_grade_subjects
-            if any(subject.lower() in tag.lower() or tag.lower() in subject.lower()
-                   for tag in program_tags.union(program_skills))
-        ]
-
-        explanation_parts = []
-
-        if matching_interests:
-            explanation_parts.append(
-                f"Based on your interests in {', '.join(matching_interests[:3])}"
-            )
-
-        if relevant_subjects:
-            explanation_parts.append(
-                f"your strong performance in {', '.join(relevant_subjects[:3])}"
-            )
-
-        if not explanation_parts:
-            explanation_parts.append("Based on your profile")
-
-        key_skills = ', '.join(program.get('skills', [])[:3])
-        if key_skills:
-            explanation_parts.append(
-                f"you'll develop skills in {key_skills}"
-            )
-
-        return ', '.join(explanation_parts) + '.'
-
-recommender_engine = ContentBasedRecommender()
+# Global Instance
+content_recommender = ContentRecommender()

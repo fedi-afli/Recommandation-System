@@ -1,41 +1,38 @@
-from pydantic import BaseModel, EmailStr
-from typing import List, Dict, Optional
-from datetime import datetime
+from sqlalchemy import Column, String, Float, Integer, JSON, Boolean, ForeignKey
+from .database import Base
 
-class StudentProfile(BaseModel):
-    name: str
-    email: EmailStr
-    interests: List[str]
-    grades: Dict[str, float]
+class Student(Base):
+    __tablename__ = "students"
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String)
+    email = Column(String, unique=True, index=True) 
+    interests = Column(JSON) 
+    grades = Column(JSON)
 
-class StudentUpdate(BaseModel):
-    name: Optional[str] = None
-    interests: Optional[List[str]] = None
-    grades: Optional[Dict[str, float]] = None
+class Program(Base):
+    __tablename__ = "programs"
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String)
+    description = Column(String)
+    tags = Column(JSON)
+    skills = Column(JSON)      
+    requirements = Column(JSON)
 
-class Program(BaseModel):
-    id: str
-    name: str
-    description: str
-    tags: List[str]
-    skills: List[str]
-    requirements: Dict
+class Recommendation(Base):
+    __tablename__ = "recommendations"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, ForeignKey("students.id"))
+    program_id = Column(String, ForeignKey("programs.id")) # Changed to ID link
+    program_name = Column(String)
+    score = Column(Float)
+    explanation = Column(String)
 
-class Recommendation(BaseModel):
-    program_id: str
-    program_name: str
-    program_description: str
-    score: float
-    explanation: str
-    tags: List[str]
-    skills: List[str]
-
-class FeedbackSubmit(BaseModel):
-    program_id: str
-    rating: Optional[int] = None
-    clicked: bool = False
-    accepted: bool = False
-
-class RecommendationRequest(BaseModel):
-    student_id: str
-    top_k: int = 5
+# NEW TABLE: This stores what users actually liked/clicked
+class Feedback(Base):
+    __tablename__ = "feedback"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, ForeignKey("students.id"))
+    program_id = Column(String, ForeignKey("programs.id"))
+    clicked = Column(Boolean, default=False)
+    accepted = Column(Boolean, default=False)
+    rating = Column(Integer, nullable=True) # 1-5 stars
